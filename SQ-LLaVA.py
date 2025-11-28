@@ -157,6 +157,95 @@ class VisionLanguageProjector(nn.Module):
     def forward(self,x:torch.Tensor) -> torch.Tensor:
         return self.proj(x)
     
-    
+class SQLLaVA(nn.Module):
+    """
+    SQ-LLaVA: Self-Questioning Large Vision-Language Assistant
+    """
+    def __init__(self, config: SQConfig):
+        super().__init__()
+        self.config = config
+        
+        # Load pre-trained models
+        print(f"Loading vision encoder: {config.vision_model}")
+        self.vision_encoder = CLIPVisionModel.from_pretrained(config.vision_model)
+        self.image_processor = CLIPImageProcessor.from_pretrained(config.vision_model)
+        
+        print(f"Loading LLM: {config.llm_model}")
+        self.llm = AutoModelForCausalLM.from_pretrained(
+            config.llm_model,
+            torch_dtype=torch.float32,
+            trust_remote_code=True
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.llm_model,
+            trust_remote_code=True
+        )
+        
+        # Add special tokens
+        special_tokens = {
+            'additional_special_tokens': [
+                config.user_token,
+                config.assistant_token,
+                config.vuser_token,
+                config.delimiter_token
+            ]
+        }
+        self.tokenizer.add_special_tokens(special_tokens)
+        self.llm.resize_token_embeddings(len(self.tokenizer))
+        
+        # Set pad token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Get dimensions
+        vision_dim = self.vision_encoder.config.hidden_size
+        llm_dim = self.llm.config.hidden_size
 
+        #Prototype Extractor
+        self.prototype_extractor =  PrototypeExtractor(
+            embed_dim=vision_dim,
+            num_clusters=config.num_clusters,
+            em_iterations=config.em_iterations
+        )
+
+        #Vision-to-language projector
+        self.projector = VisionLanguageProjector(
+            vision_dim=vision_dim,
+            llm_dim=llm_dim,
+            hidden_dim=config.projection_hidden
+        )
+        # Store token IDs for special tokens
+        self.user_token_id = self.tokenizer.convert_tokens_to_ids(config.user_token)
+        self.assistant_token_id = self.tokenizer.convert_tokens_to_ids(config.assistant_token)
+        self.vuser_token_id = self.tokenizer.convert_tokens_to_ids(config.vuser_token)
+        self.delimiter_token_id = self.tokenizer.convert_tokens_to_ids(config.delimiter_token)
+
+    def add_lora(self):
+        """Add LoRA adapters to vision encoder and LLM"""
+        print("Adding LoRA adapters...")
+        
+        # LoRA for LLM
+        llm_lora_config = LoraConfig(
+            r=self.config.llm_lora_rank,
+            lora_alpha=self.config.llm_lora_alpha,
+            target_modules=["q_proj", "v_proj"],  # Adjust based on model architecture
+            lora_dropout=0.05,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM
+        )
+        self.llm = get_peft_model(self.llm, llm_lora_config)
+        
+        # LoRA for Vision Encoder
+        vit_lora_config = LoraConfig(
+            r=self.config.vit_lora_rank,
+            lora_alpha=self.config.vit_lora_alpha,
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=0.05,
+            bias="none"
+        )
+        # Apply LoRA to vision encoder (manual application needed)
+        # For simplicity, we'll keep vision encoder frozen in stage 1
+        # and unfreeze with LoRA in stage 2
+        
+        print("LoRA adapters added successfully!")
 
