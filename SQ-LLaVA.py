@@ -249,3 +249,154 @@ class SQLLaVA(nn.Module):
         
         print("LoRA adapters added successfully!")
 
+    def encode_image(self,images:torch.Tensor) -> torch.Tensor:
+        """
+        Encode images to visual tokens
+        Args:
+                images: Preprocessed images [batch, 3, H, W]
+            Returns:
+                vision_embeds: Visual embeddings [batch, num_tokens, llm_dim]
+        """
+        #Get vision features.
+        vision_outputs = self.vision_encoder(images,output_hidden_states=True)
+        vision_features = vision_outputs.last_hidden_state # [batch, num_patches, vision_dim]
+        
+        #Enhanced with prototype extractor
+        enhanced_features = self.prototype_extractor(vision_features)
+
+        #Project to language space
+        vision_embeds = self.projector(enhanced_features)
+        return vision_embeds
+    
+    def prepare_inputs_embeds(
+        self,
+        vision_embeds: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Combine vision embeddings with text embeddings
+        Args:
+            vision_embeds: [batch, num_vision_tokens, llm_dim]
+            input_ids: [batch, seq_len]
+            attention_mask: [batch, seq_len]
+        Returns:
+            inputs_embeds: Combined embeddings [batch, total_len, llm_dim]
+            new_attention_mask: Updated attention mask [batch, total_len]
+        """
+        batch_size = input_ids.shape[0]
+        num_vision_tokens = vision_embeds.shape[1]
+        
+        # Get text embeddings
+        text_embeds = self.llm.get_input_embeddings()(input_ids)  # [batch, seq_len, llm_dim]
+        
+        # Concatenate: [vision_embeds | text_embeds]
+        inputs_embeds = torch.cat([vision_embeds, text_embeds], dim=1)
+        
+        # Update attention mask
+        vision_mask = torch.ones(
+            batch_size, num_vision_tokens,
+            dtype=attention_mask.dtype,
+            device=attention_mask.device
+        )
+        new_attention_mask = torch.cat([vision_mask, attention_mask], dim=1)
+        
+        return inputs_embeds, new_attention_mask
+    
+    def forward(
+        self,
+        images: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: Optional[torch.Tensor] = None
+    ) -> Dict:
+        """
+        Forward pass
+        Args:
+            images: [batch, 3, H, W]
+            input_ids: [batch, seq_len]
+            attention_mask: [batch, seq_len]
+            labels: [batch, seq_len] for loss computation
+        Returns:
+            Dictionary with loss and logits
+        """
+        #Encode images
+        vision_embeds = self.encode_image(images)
+
+        #Prepare combined inputs
+        inputs_embeds,new_attention_mask = self.prepare_inputs_embeds(vision_embeds,input_ids,attention_mask)
+        # Prepare labels if provided
+        if labels is not None:
+            num_vision_tokens = vision_embeds.shape[1]
+            # Pad labels with -100 for vision tokens (ignore in loss)
+            vision_labels = torch.full(
+                (labels.shape[0], num_vision_tokens),
+                -100,
+                dtype=labels.dtype,
+                device=labels.device
+            )
+            new_labels = torch.cat([vision_labels, labels], dim=1)
+        else:
+            new_labels = None
+        
+        # Forward through LLM
+        outputs = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=new_attention_mask,
+            labels=new_labels,
+            return_dict=True
+        )
+        
+        return {
+            'loss': outputs.loss,
+            'logits': outputs.logits
+        }
+    
+    def generate(
+        self,
+        images: torch.Tensor,
+        prompt: str,
+        max_new_tokens: int = 128,
+        temperature: float = 0.7,
+        top_p: float = 0.9
+    ) -> str:
+        """Generate response for inference"""
+        self.eval()
+        with torch.no_grad():
+            # Encode image
+            vision_embeds = self.encode_image(images)
+            
+            # Tokenize prompt
+            inputs = self.tokenizer(
+                prompt,
+                return_tensors="pt",
+                padding=True,
+                truncation=True
+            ).to(images.device)
+            
+            # Prepare inputs
+            inputs_embeds, attention_mask = self.prepare_inputs_embeds(
+                vision_embeds,
+                inputs.input_ids,
+                inputs.attention_mask
+            )
+            
+            # Generate
+            outputs = self.llm.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+            
+            # Decode (skip the prompt part)
+            response = self.tokenizer.decode(
+                outputs[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=True
+            )
+            
+            return response
