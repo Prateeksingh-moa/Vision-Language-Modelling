@@ -142,5 +142,21 @@ class PrototypeExtractor(nn.Module):
         
         return enhanced_z_v
 
+class VisionLanguageProjector(nn.Module):
+    """
+    Two-layer MLP projector from vision to language space
+    """
+    def __init__(self,vision_dim:int,llm_dim:int,hidden_dim:int=512):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(vision_dim,hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim,llm_dim)
+        )
+
+    def forward(self,x:torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+    
+    
 
 
