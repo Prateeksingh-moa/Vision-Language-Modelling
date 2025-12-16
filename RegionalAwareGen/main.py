@@ -80,3 +80,40 @@ class ChestAnatomySegmenter(nn.Module):
         
         masks = torch.sigmoid(self.seg_head(d1))
         return masks
+    
+class VisualEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        try:
+            from torchvision.models import ResNet50_Weights
+            weights = ResNet50_Weights.DEFAULT
+            resnet = models.resnet50(weights=weights)
+        except:
+            resnet = models.resnet50(pretrained=True)
+            
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        self.feature_dim = 2048
+    
+    def forward(self, x):
+        return self.backbone(x)
+    
+class RegionTokenConstructor(nn.Module):
+    def __init__(self,visual_dim=2048,token_dim=768):
+        super().__init__()
+        self.projection = nn.Linear(visual_dim,token_dim)
+    
+    def forward(self,visual_features,masks):
+        B,C,H,W = visual_features.shape
+        masks_resized = F.interpolate(masks,size=(H,W),mode='bilinear',align_corners=False)
+
+        region_tokens = []
+        for i in range(masks.shape[1]):
+            mask = masks_resized[:,i:i+1]
+            masked_features = visual_features*mask
+            sum_features = masked_features.sum(dim=[2,3])
+            sum_mask = mask.sum(dim=[2, 3]) + 1e-8
+            avg_features = sum_features / sum_mask
+            token = self.projection(avg_features)
+            region_tokens.append(token)
+        
+        return torch.stack(region_tokens, dim=1)
